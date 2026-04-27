@@ -1,0 +1,10 @@
+# Runtime state
+state.json
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
