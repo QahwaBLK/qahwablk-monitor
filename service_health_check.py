@@ -42,6 +42,16 @@ EXTERNAL_CHECKS = [
     ("pulse_external",   "Pulse (external)",   "https://pulse.blk.jo"),
 ]
 
+# Waitlist (qahwablk-waitlist.service on :8099) is checked separately because
+# it uses a "GET /webhook?hub.mode=subscribe&...&hub.challenge=X" handshake
+# and we want to alert only after 3 consecutive failures (~15 min downtime).
+WAITLIST_VERIFY_TOKEN = "qahwablk_waitlist_2026"
+WAITLIST_HEALTH_URL = (
+    f"http://localhost:8099/webhook"
+    f"?hub.mode=subscribe&hub.verify_token={WAITLIST_VERIFY_TOKEN}&hub.challenge=health"
+)
+WAITLIST_FAILURE_THRESHOLD = 3
+
 # Map external check name → internal check name (for mismatch detection)
 EXTERNAL_TO_INTERNAL = {
     "cashier_external": "cashier_frontend_internal",
@@ -110,6 +120,90 @@ def http_check(url: str, timeout: int = 10) -> tuple[int | None, float]:
         status = None
     latency_ms = int((time.monotonic() - t0) * 1000)
     return status, latency_ms
+
+
+def http_check_with_body(url: str, timeout: int = 10) -> tuple[int | None, float, str]:
+    """Like http_check but also returns the response body (capped at 256 bytes)."""
+    t0 = time.monotonic()
+    body = ""
+    status = None
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "qahwablk-health-check/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.status
+            body = resp.read(256).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        status = e.code
+    except Exception:
+        status = None
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    return status, latency_ms, body
+
+
+def ensure_alert_state_schema(cur):
+    """Idempotently add consecutive_failures column for threshold-based alerts."""
+    cur.execute(
+        "ALTER TABLE cashier_alert_state ADD COLUMN IF NOT EXISTS consecutive_failures INT DEFAULT 0"
+    )
+
+
+def increment_consecutive_failures(cur, alert_key: str) -> int:
+    """Insert or increment consecutive_failures; returns new count."""
+    cur.execute(
+        """
+        INSERT INTO cashier_alert_state
+            (alert_key, consecutive_failures, is_active,
+             first_detected_at, last_detected_at, last_alerted_at)
+        VALUES (%s, 1, true, NOW(), NOW(), 'epoch'::timestamptz)
+        ON CONFLICT (alert_key) DO UPDATE SET
+            consecutive_failures = cashier_alert_state.consecutive_failures + 1,
+            last_detected_at     = NOW(),
+            is_active            = true,
+            resolved_at          = NULL
+        RETURNING consecutive_failures
+        """,
+        (alert_key,),
+    )
+    return cur.fetchone()["consecutive_failures"]
+
+
+def reset_consecutive_failures(cur, alert_key: str):
+    cur.execute(
+        "UPDATE cashier_alert_state SET consecutive_failures = 0 WHERE alert_key = %s",
+        (alert_key,),
+    )
+
+
+def waitlist_alert_decision(cur, alert_key: str, consecutive_failures: int) -> tuple[bool, str]:
+    """
+    Decide whether to alert for the waitlist check.
+
+    First alert fires the moment consecutive_failures crosses the threshold
+    (~15 min downtime at 5-min cron cadence). Reminders use the existing
+    REMINDER_INTERVAL_SECONDS (30 min) gap.
+    """
+    if consecutive_failures < WAITLIST_FAILURE_THRESHOLD:
+        return False, "below_threshold"
+
+    cur.execute(
+        "SELECT last_alerted_at FROM cashier_alert_state WHERE alert_key = %s",
+        (alert_key,),
+    )
+    row = cur.fetchone()
+    last_alerted = row["last_alerted_at"] if row else None
+    if last_alerted and last_alerted.tzinfo is None:
+        last_alerted = last_alerted.replace(tzinfo=timezone.utc)
+
+    now = datetime.now(timezone.utc)
+    # Threshold just crossed (or row is fresh from increment_consecutive_failures
+    # which seeds last_alerted_at='epoch') → fire first alert.
+    if last_alerted is None or (now - last_alerted).total_seconds() >= REMINDER_INTERVAL_SECONDS:
+        cur.execute(
+            "UPDATE cashier_alert_state SET last_alerted_at = NOW() WHERE alert_key = %s",
+            (alert_key,),
+        )
+        return True, "new" if consecutive_failures == WAITLIST_FAILURE_THRESHOLD else "reminder"
+    return False, "skip"
 
 
 # ── Nginx backup ─────────────────────────────────────────────────────────────
@@ -243,6 +337,7 @@ def main():
         sys.exit(1)
 
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    ensure_alert_state_schema(cur)
 
     # ── Internal checks ──────────────────────────────────────────────────────
     internal_results: dict[str, dict] = {}
@@ -343,6 +438,51 @@ def main():
                 send_telegram(bot_token, chat_id, msg)
         else:
             resolve_alert(cur, alert_key)
+
+    # ── Waitlist check (3 consecutive failures threshold) ───────────────────
+    waitlist_status, waitlist_latency, waitlist_body = http_check_with_body(WAITLIST_HEALTH_URL)
+    waitlist_ok = waitlist_status == 200 and waitlist_body.strip() == "health"
+    waitlist_audit = "pass" if waitlist_ok else "fail"
+    log_audit(cur, "waitlist_internal", waitlist_audit, {
+        "url":         WAITLIST_HEALTH_URL,
+        "status_code": waitlist_status,
+        "latency_ms":  waitlist_latency,
+        "body":        waitlist_body[:64],
+    })
+
+    waitlist_alert_key = "service_health:waitlist_internal"
+    if not waitlist_ok:
+        n = increment_consecutive_failures(cur, waitlist_alert_key)
+        log.info(
+            f"[waitlist_internal] {waitlist_status} {waitlist_latency}ms "
+            f"body={waitlist_body[:32]!r} consecutive={n}/{WAITLIST_FAILURE_THRESHOLD} — fail"
+        )
+        should_send, alert_type = waitlist_alert_decision(cur, waitlist_alert_key, n)
+        if should_send and bot_token:
+            prefix = "🔴 SERVICE DOWN" if alert_type == "new" else "🟡 REMINDER: SERVICE DOWN"
+            msg = (
+                f"{prefix}\n"
+                f"<b>Waitlist API (qahwablk-waitlist :8099)</b> failing health check\n"
+                f"Consecutive failures: {n} (~{n*5} min downtime)\n"
+                f"Status: {waitlist_status or 'timeout'}  body={waitlist_body[:32]!r}\n"
+                f"URL: {WAITLIST_HEALTH_URL}\n"
+                f"Server: RhythmOS (89.167.18.87)\n"
+                f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+            )
+            send_telegram(bot_token, chat_id, msg)
+    else:
+        log.info(
+            f"[waitlist_internal] {waitlist_status} {waitlist_latency}ms "
+            f"body={waitlist_body[:32]!r} — pass"
+        )
+        reset_consecutive_failures(cur, waitlist_alert_key)
+        if resolve_alert(cur, waitlist_alert_key) and bot_token:
+            msg = (
+                f"🟢 RESOLVED: SERVICE RECOVERED\n"
+                f"<b>Waitlist API (qahwablk-waitlist :8099)</b> is back up\n"
+                f"Server: RhythmOS (89.167.18.87)"
+            )
+            send_telegram(bot_token, chat_id, msg)
 
     conn.close()
     log.info("=== service_health_check done ===")
