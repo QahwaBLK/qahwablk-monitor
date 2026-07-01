@@ -1,0 +1,83 @@
+name: Stale PR Auto-Ping
+
+on:
+  schedule:
+    - cron: '0 8 * * 1'  # Every Monday at 08:00 UTC
+  workflow_dispatch:
+
+jobs:
+  ping-stale-prs:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+
+    steps:
+      - name: Ping stale PRs targeting main
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const SEVEN_DAYS_MS  = 7  * 24 * 60 * 60 * 1000;
+            const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
+            const BOT_LOGIN  = 'github-actions[bot]';
+            const MARKER_7D  = '<!-- stale-ping-7d -->';
+            const MARKER_14D = '<!-- stale-ping-14d -->';
+            const now = Date.now();
+
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              state: 'open',
+              base: 'main',
+              per_page: 100,
+            });
+
+            for (const pr of prs) {
+              if (pr.draft) continue;
+
+              const num    = pr.number;
+              const author = pr.user.login;
+
+              const [commentsRes, reviewsRes, commitsRes] = await Promise.all([
+                github.rest.issues.listComments({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: num, per_page: 100,
+                }),
+                github.rest.pulls.listReviews({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  pull_number: num, per_page: 100,
+                }),
+                github.rest.pulls.listCommits({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  pull_number: num, per_page: 100,
+                }),
+              ]);
+
+              const humanComments = commentsRes.data.filter(c => c.user.login !== BOT_LOGIN);
+              const botComments   = commentsRes.data.filter(c => c.user.login === BOT_LOGIN);
+
+              const dates = [new Date(pr.created_at).getTime()];
+              if (humanComments.length)   dates.push(new Date(humanComments.at(-1).created_at).getTime());
+              if (reviewsRes.data.length) dates.push(new Date(reviewsRes.data.at(-1).submitted_at).getTime());
+              if (commitsRes.data.length) dates.push(new Date(commitsRes.data.at(-1).commit.committer.date).getTime());
+
+              const lastActivity = Math.max(...dates);
+              const idleMs = now - lastActivity;
+              const idleDays = Math.floor(idleMs / 86400000);
+
+              const has7dPing  = botComments.some(c => c.body.includes(MARKER_7D));
+              const has14dPing = botComments.some(c => c.body.includes(MARKER_14D));
+
+              if (idleMs >= FOURTEEN_DAYS_MS && !has14dPing) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: num,
+                  body: [MARKER_14D, `**Stale PR - ${idleDays} days idle**`, '', `This PR has had no activity for ${idleDays} days. Please take one of the following actions:`, '', '- **Approve and merge** - if the branch is ready', '- **Push an update** - if changes are needed', '- **Close the PR** - if this work is no longer relevant', '', `Pinging @${author}. If no action is taken this week, the team may close this PR.`].join('\n'),
+                });
+              } else if (idleMs >= SEVEN_DAYS_MS && !has7dPing) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: num,
+                  body: [MARKER_7D, `**Stale PR - ${idleDays} days idle**`, '', `This PR has had no activity for ${idleDays} days.`, 'Please leave a comment, push an update, or close the PR if it is no longer needed.', '', `Pinging @${author}.`].join('\n'),
+                });
+              }
+            }
