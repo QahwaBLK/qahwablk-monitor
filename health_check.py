@@ -7,6 +7,7 @@ Sends Telegram alerts on first failure; suppresses repeats until recovery.
 
 import json
 import logging
+import shutil
 import socket
 import ssl
 import subprocess
@@ -45,6 +46,12 @@ FRESHNESS_CHECKS = [
     ("zenhr_attendance",      "attendance_date", 36, "ZenHR attendance sync"),
     ("operate_daily_tasks",   "date",             6, "operate pipeline"),
     ("shop_daily_health",     "date",            36, "beat health score"),
+]
+
+# (mount point, alert threshold % used)
+DISK_CHECKS = [
+    ("/",                        90),
+    ("/mnt/HC_Volume_105265098", 90),
 ]
 
 # ---------------------------------------------------------------------------
@@ -162,6 +169,17 @@ def check_freshness(table, date_col, max_age_hours, label):
         return False, "{}: {}".format(table, exc)
 
 
+def check_disk(path, threshold_pct):
+    try:
+        usage = shutil.disk_usage(path)
+        pct = usage.used / usage.total * 100
+        detail = "{:.0f}% used, {:.1f}G free (threshold {}%)".format(
+            pct, usage.free / 2**30, threshold_pct)
+        return pct < threshold_pct, detail
+    except Exception as exc:
+        return False, "{}: {}".format(path, exc)
+
+
 def check_odoo(odoo_url):
     try:
         host = odoo_url.replace("https://", "").replace("http://", "").split("/")[0]
@@ -249,6 +267,11 @@ def main():
         for table, date_col, max_age_h, label in FRESHNESS_CHECKS:
             ok, detail = check_freshness(table, date_col, max_age_h, label)
             evaluate("freshness:" + table, ok, detail, "freshness/" + label)
+
+    # 4b. Disk usage thresholds
+    for mount, threshold in DISK_CHECKS:
+        ok, detail = check_disk(mount, threshold)
+        evaluate("disk:" + mount, ok, detail, "disk/" + mount)
 
     # 5. External services
     if odoo_url:
