@@ -1,0 +1,158 @@
+# Template: copy to any QahwaBLK repo. Set BASE_BRANCH below to the repo's
+# production branch (main for most repos, master for rhythmos-core).
+
+name: PR Pre-flight
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+env:
+  BASE_BRANCH: main
+
+jobs:
+  base-branch-check:
+    name: Base must be production branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce base branch
+        run: |
+          if [ "${{ github.base_ref }}" != "${BASE_BRANCH}" ]; then
+            echo "::error::PR targets '${{ github.base_ref }}'. Retarget to '${BASE_BRANCH}'. Staging is retired."
+            exit 1
+          fi
+          echo "Base branch is ${BASE_BRANCH}. OK."
+
+  branch-freshness:
+    name: Branch caught up with base
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch base
+        run: git fetch origin "${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}" --quiet
+      - name: Reject stale branches
+        run: |
+          BEHIND=$(git rev-list --count HEAD..origin/${BASE_BRANCH})
+          echo "Branch is ${BEHIND} commits behind origin/${BASE_BRANCH}."
+          if [ "$BEHIND" -gt 30 ]; then
+            echo "::error::Branch is ${BEHIND} commits behind ${BASE_BRANCH}. It was almost certainly cut from an old base. Rebase onto current ${BASE_BRANCH} (or start fresh and cherry-pick your change) before merging."
+            exit 1
+          fi
+          if [ "$BEHIND" -gt 0 ]; then
+            echo "::warning::Branch is ${BEHIND} commits behind ${BASE_BRANCH}. Rebasing before merge is recommended."
+          fi
+
+  migration-parent-check:
+    name: Migration parent exists on base
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch base
+        run: git fetch origin "${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}" --quiet
+      - name: Verify down_revision chain
+        run: |
+          NEW=$(git diff --name-only --diff-filter=A origin/${BASE_BRANCH}...HEAD -- 'alembic/versions/*.py' || true)
+          if [ -z "$NEW" ]; then
+            echo "No new migrations. OK."
+            exit 0
+          fi
+          extract() { sed -E "s/.*=[[:space:]]*//; s/[\"' ]//g; s/#.*//"; }
+          # revision ids known on base, plus those added in this PR
+          git grep -h -E "^revision[[:space:]]*=" origin/${BASE_BRANCH} -- 'alembic/versions/*.py' 2>/dev/null | extract > /tmp/known.txt || true
+          for f in $NEW; do
+            grep -E "^revision[[:space:]]*=" "$f" | extract >> /tmp/known.txt
+          done
+          FAIL=0
+          for f in $NEW; do
+            DR=$(grep -E "^down_revision[[:space:]]*=" "$f" | head -1 | extract)
+            if [ -z "$DR" ] || [ "$DR" = "None" ]; then
+              echo "$f: base migration (down_revision None). OK."
+              continue
+            fi
+            if grep -qxF "$DR" /tmp/known.txt; then
+              echo "$f: parent '$DR' found. OK."
+            else
+              echo "::error::$f: down_revision '$DR' is not on ${BASE_BRANCH} and not added in this PR. This migration depends on unmerged work. Land the parent migration first."
+              FAIL=1
+            fi
+          done
+          [ "$FAIL" = "0" ]
+
+  data-pr-guard:
+    name: Data PR needs rollback plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require rollback section + label on DB changes
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          git fetch origin "${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}" --quiet
+          CHANGED=$(git diff --name-only origin/${BASE_BRANCH}...HEAD -- 'alembic/**' || true)
+          if [ -z "$CHANGED" ]; then
+            echo "No DB/migration changes. OK."
+            exit 0
+          fi
+          echo "::warning::This is a DATA PR (touches alembic/). Admin merges it after a fresh backup."
+          echo "$CHANGED"
+          MISSING=0
+          echo "$PR_BODY" | grep -qiE '## *rollback' || { echo "::error::Data PR is missing a '## Rollback' section describing how to undo the migration."; MISSING=1; }
+          echo ",$LABELS," | grep -q ',data-pr,' || { echo "::error::Data PR must carry the 'data-pr' label so it is not fast-merged."; MISSING=1; }
+          [ "$MISSING" = "0" ]
+
+  size-guard:
+    name: PR is small and focused
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Flag oversized PRs
+        env:
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          git fetch origin "${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}" --quiet
+          FILES=$(git diff --name-only origin/${BASE_BRANCH}...HEAD | wc -l | tr -d ' ')
+          ADDS=$(git diff --numstat origin/${BASE_BRANCH}...HEAD | awk '{s+=$1} END{print s+0}')
+          echo "Changed files: ${FILES}, additions: ${ADDS}"
+          if echo ",$LABELS," | grep -q ',large-pr-ok,'; then
+            echo "large-pr-ok label present, skipping size gate."
+            exit 0
+          fi
+          if [ "$FILES" -gt 40 ] || [ "$ADDS" -gt 4000 ]; then
+            echo "::error::PR changes ${FILES} files / +${ADDS} lines. This looks like bundled work, not one logical change. Split it, or add the 'large-pr-ok' label if it is genuinely one change."
+            exit 1
+          fi
+          echo "Size OK."
+
+  sql-format-scan:
+    name: SQL string-format scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan added lines for SQL string interpolation
+        run: |
+          git fetch origin "${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}" --quiet
+          # only added Python lines in this PR (ignore pre-existing code)
+          git diff origin/${BASE_BRANCH}...HEAD -- '*.py' | grep -E '^\+' | grep -v '^\+\+\+' > /tmp/added.txt || true
+          if [ ! -s /tmp/added.txt ]; then
+            echo "No added Python lines. OK."
+            exit 0
+          fi
+          # flag interpolation inside execute()/executemany(): the real injection vector
+          BAD=$(grep -nE 'execute(many)?[[:space:]]*\(' /tmp/added.txt | grep -E "\.format\(|f\"|f'|%[^s(]" || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::Added code interpolates into an execute() call. Use %s parameterized queries with an args tuple."
+            printf '%s\n' "$BAD"
+            exit 1
+          fi
+          echo "SQL scan (added lines) passed."

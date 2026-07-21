@@ -1,0 +1,91 @@
+name: Conflict Notifier
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  notify-conflicts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PRs for new conflicts
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const base = context.ref.replace('refs/heads/', '');
+
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              base,
+              per_page: 100
+            });
+
+            core.info(`Checking ${prs.length} open PRs targeting ${base}`);
+
+            for (const pr of prs) {
+              // GitHub computes mergeable lazily — poll until known
+              let detail = pr;
+              for (let i = 0; detail.mergeable === null && i < 5; i++) {
+                await new Promise(r => setTimeout(r, 4000));
+                const res = await github.rest.pulls.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number
+                });
+                detail = res.data;
+              }
+
+              if (detail.mergeable !== false) {
+                core.info(`PR #${pr.number}: no conflict, skipping`);
+                continue;
+              }
+
+              // Dedup: skip if the bot already commented about a conflict
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                per_page: 100
+              });
+
+              // Dedup is scoped to the current base SHA: if a PR conflict was resolved
+              // and a new push creates a fresh conflict, the old comment has a different
+              // SHA so alreadyNotified correctly returns false.
+              const alreadyNotified = comments.some(
+                c => c.user.login === 'github-actions[bot]' &&
+                     c.body.includes('merge conflict') &&
+                     c.body.includes(context.sha.slice(0, 7))
+              );
+
+              if (alreadyNotified) {
+                core.info(`PR #${pr.number}: already notified, skipping`);
+                continue;
+              }
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                body: [
+                  `@${pr.user.login} This PR has a merge conflict with \`${base}\` after the latest push (\`${context.sha.slice(0, 7)}\`).`,
+                  '',
+                  'Please rebase or merge the base branch to resolve it:',
+                  '```bash',
+                  `git fetch origin ${base}`,
+                  `git rebase origin/${base}`,
+                  '# resolve any conflicts, then:',
+                  'git push --force-with-lease',
+                  '```',
+                ].join('\n')
+              });
+
+              core.info(`Notified @${pr.user.login} about conflict on PR #${pr.number}`);
+            }
