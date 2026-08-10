@@ -252,12 +252,6 @@ PIPELINE_WINDOWS = {
     "sales-intelligence/ceo-dashboard":      36 * 3600, # daily overnight
     "operate-pipeline/sync-tasks":           20 * 60,   # every 10 min during hours
     "zenhr-pipeline/attendance":             4 * 3600,  # every 30 min business hours; 4h for off-hours slack
-    "pulse/daily-points":                    30 * 60,   # every 15 min during business hours
-    "pulse/streak-calculator":               36 * 3600, # daily
-    "pulse/pos-attribution":                 30 * 60,   # every 15 min
-    "pulse/cups-served":                     30 * 60,   # every 15 min
-    "pulse/score-calculator":                60 * 60,   # every 30 min
-    "pulse/health-calculator":               36 * 3600, # daily
 }
 
 

@@ -30,13 +30,10 @@ STATE_FILE     = "/srv/qahwablk/monitor/state.json"
 
 SERVICES = [
     "cashier-api", "cashier-frontend",
-
-    "pulse-api",   "pulse-frontend",
 ]
 
 ENDPOINTS = [
     ("cashier", "https://cashier.blk.jo"),
-    ("pulse",   "https://pulse.blk.jo"),
 ]
 
 # (table, date_column, max_age_hours, human_label)
