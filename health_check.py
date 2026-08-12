@@ -34,6 +34,7 @@ SERVICES = [
 
 ENDPOINTS = [
     ("cashier", "https://cashier.blk.jo"),
+    ("shareeb", "https://shareeb.blk.jo"),
 ]
 
 # (table, date_column, max_age_hours, human_label)

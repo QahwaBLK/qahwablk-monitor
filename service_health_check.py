@@ -35,6 +35,7 @@ INTERNAL_CHECKS = [
     ("pulse_frontend_internal",   "Pulse Frontend (internal)",   "http://localhost:3003", lambda s: s == 200),
     ("cashier_api_internal",      "Cashier API (internal)",      "http://localhost:8001/health", lambda s: s == 200),
     ("pulse_api_internal",        "Pulse API (internal)",        "http://localhost:8003/api/health", lambda s: s == 200),
+    ("shareeb_api_internal",      "Shareeb API (internal)",      "http://localhost:8097/healthz", lambda s: s == 200),
 ]
 
 EXTERNAL_CHECKS = [
