@@ -252,6 +252,7 @@ PIPELINE_WINDOWS = {
     "sales-intelligence/ceo-dashboard":      36 * 3600, # daily overnight
     "operate-pipeline/sync-tasks":           20 * 60,   # every 10 min during hours
     "zenhr-pipeline/attendance":             4 * 3600,  # every 30 min business hours; 4h for off-hours slack
+    "odoo-pipeline/daily-shop-metrics":      18 * 3600, # daily 04:00 UTC timer; audit runs 03:00 UTC
 }
 
 
