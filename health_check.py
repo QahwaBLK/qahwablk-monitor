@@ -44,6 +44,7 @@ FRESHNESS_CHECKS = [
     ("zenhr_attendance",      "attendance_date", 36, "ZenHR attendance sync"),
     ("operate_daily_tasks",   "date",             6, "operate pipeline"),
     ("shop_daily_health",     "date",            36, "beat health score"),
+    ("shop_compliance_scores", "created_at",     36, "shop compliance calculator"),
 ]
 
 # (mount point, alert threshold % used)
@@ -51,6 +52,28 @@ DISK_CHECKS = [
     ("/",                        90),
     ("/mnt/HC_Volume_105265098", 90),
 ]
+
+# Internal health endpoints (healthy means exactly HTTP 200)
+INTERNAL_ENDPOINTS = [
+    ("shareeb-api-internal", "http://localhost:8097/healthz"),
+]
+
+# Waitlist webhook handshake (qahwablk-waitlist.service on :8099). Meta-style
+# hub.challenge echo: healthy = HTTP 200 with body exactly "health".
+# min_failures=3 in main() = alert only after ~15 min down at the 5-min cadence.
+WAITLIST_VERIFY_TOKEN = "qahwablk_waitlist_2026"
+WAITLIST_HEALTH_URL = (
+    "http://localhost:8099/webhook"
+    "?hub.mode=subscribe&hub.verify_token={}&hub.challenge=health".format(WAITLIST_VERIFY_TOKEN)
+)
+
+# Nginx config drift: live file vs known-good baseline. Baseline must be
+# refreshed (cp live -> baseline) whenever a config change is deliberate.
+# Pulse omitted: service sunset. Ported from service_health_check.py.
+NGINX_BACKUP_DIR = Path("/srv/shared/server-docs/nginx-backups")
+NGINX_CONFIGS = {
+    "cashier": "/etc/nginx/sites-enabled/cashier.blk.jo",
+}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -178,6 +201,52 @@ def check_disk(path, threshold_pct):
         return False, "{}: {}".format(path, exc)
 
 
+def check_internal(url):
+    """Internal health endpoint: healthy means exactly HTTP 200."""
+    req = urllib.request.Request(url, headers={"User-Agent": "BLK-HealthCheck/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status == 200, "HTTP {}".format(resp.status)
+    except urllib.error.HTTPError as exc:
+        return False, "HTTP {}".format(exc.code)
+    except Exception as exc:
+        return False, str(exc)
+
+
+def check_waitlist():
+    """Webhook handshake: healthy = HTTP 200 and body exactly 'health'."""
+    req = urllib.request.Request(WAITLIST_HEALTH_URL, headers={"User-Agent": "BLK-HealthCheck/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read(64).decode("utf-8", errors="replace").strip()
+            if resp.status == 200 and body == "health":
+                return True, "handshake ok"
+            return False, "HTTP {} body {!r}".format(resp.status, body[:32])
+    except urllib.error.HTTPError as exc:
+        return False, "HTTP {}".format(exc.code)
+    except Exception as exc:
+        return False, str(exc)
+
+
+def check_nginx_drift(name, live_path):
+    """Diff live nginx config vs known-good baseline; seed baseline if absent."""
+    backup = NGINX_BACKUP_DIR / "{}.blk.jo.conf".format(name)
+    try:
+        if not backup.exists():
+            NGINX_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(live_path, backup)
+            return True, "baseline seeded from live config"
+        r = subprocess.run(["diff", str(backup), live_path],
+                           capture_output=True, text=True, timeout=5)
+        drift = r.stdout.strip()
+        if drift:
+            return False, "{} differs from baseline ({} diff lines)".format(
+                live_path, len(drift.splitlines()))
+        return True, "matches baseline"
+    except Exception as exc:
+        return False, "{}: {}".format(name, exc)
+
+
 def check_odoo(odoo_url):
     try:
         host = odoo_url.replace("https://", "").replace("http://", "").split("/")[0]
@@ -253,6 +322,20 @@ def main():
     for label, url in ENDPOINTS:
         ok, detail = check_endpoint(url)
         evaluate("endpoint:" + label, ok, detail, "endpoint/" + url)
+
+    # 2b. Internal endpoints (exact 200)
+    for label, url in INTERNAL_ENDPOINTS:
+        ok, detail = check_internal(url)
+        evaluate("endpoint:" + label, ok, detail, "endpoint/" + label)
+
+    # 2c. Waitlist webhook handshake — 3 strikes before alerting
+    ok, detail = check_waitlist()
+    evaluate("endpoint:waitlist-handshake", ok, detail, "endpoint/waitlist :8099", min_failures=3)
+
+    # 2d. Nginx config drift
+    for name, live_path in NGINX_CONFIGS.items():
+        ok, detail = check_nginx_drift(name, live_path)
+        evaluate("nginx:" + name, ok, detail, "nginx/" + name)
 
     # 3. Database
     ok, detail = check_database()
