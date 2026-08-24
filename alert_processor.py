@@ -3,7 +3,6 @@
 
 Checks all alert sources, deduplicates, and sends Telegram messages.
 Alert sources:
-  - cashier_audit_log   (fail checks)
   - cashier_compliance_scores (fail commits, last 35 min)
   - cashier_build_status (stale builds)
   - systemctl is-active (service up/down)
@@ -198,44 +197,6 @@ def resolve_alert(cur, alert_key: str, description: str, category: str) -> bool:
 
 # ── Alert source checks ─────────────────────────────────────────────────────
 
-def check_audit_alerts(cur):
-    """Alert on latest system audit failures."""
-    cur.execute("""
-        SELECT DISTINCT ON (check_name) check_name, status, details
-        FROM cashier_audit_log
-        ORDER BY check_name, created_at DESC
-    """)
-    rows = cur.fetchall()
-
-    active_keys = set()
-    for row in rows:
-        check_name = row["check_name"]
-        status = row["status"]
-        details = row["details"] or {}
-        alert_key = f"audit:{check_name}"
-
-        if status == "fail":
-            active_keys.add(alert_key)
-            count = details.get("count", 0) if isinstance(details, dict) else 0
-            candidates = (
-                details.get("matches") or details.get("failures") or
-                details.get("stale") or details.get("stuck") or []
-            ) if isinstance(details, dict) else []
-            first_item = str(candidates[0])[:200] if candidates else str(details)[:200]
-            description = f"System audit failure: {check_name.replace('_', ' ')}"
-            detail_str = f"{count} issue(s). First: {first_item}" if count else first_item
-            process_alert(cur, alert_key, description, detail_str, "AUDIT")
-
-    # Resolve audit alerts now passing
-    cur.execute(
-        "SELECT alert_key FROM cashier_alert_state WHERE is_active = true AND alert_key LIKE 'audit:%'"
-    )
-    active_in_db = {r["alert_key"] for r in cur.fetchall()}
-    for alert_key in active_in_db - active_keys:
-        check_name = alert_key[len("audit:"):]
-        resolve_alert(cur, alert_key, f"Audit check now passing: {check_name.replace('_', ' ')}", "AUDIT")
-
-
 def check_compliance_alerts(cur):
     """Alert on failing compliance commits in the last 35 minutes."""
     cur.execute("""
@@ -377,7 +338,6 @@ def main():
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     checks = [
-        ("audit", check_audit_alerts),
         ("compliance", check_compliance_alerts),
         ("build", check_build_alerts),
         ("service", check_service_alerts),
