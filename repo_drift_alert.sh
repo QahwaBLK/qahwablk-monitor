@@ -89,6 +89,27 @@ for d in "$ROOT"/*/; do
     fi
 done
 
+# ── Root-wrapper sync check (2026-08-24) ────────────────────────────────────
+# /srv/qahwablk/order-deploy.sh is root-owned OUTSIDE the repo (so qahwablk
+# code cannot rewrite what cron executes as root), and its source of truth is
+# the tracked copy in order-pickup. That split drifted silently once: the
+# 2026-08-18 Guard 2 outage protection never reached the cron path and its
+# absence was invisible for six days. This check makes that drift a daily
+# Telegram line instead. Missing tracked copy counts as drift too — it means
+# the live file no longer has a source of truth.
+WRAPPER_LIVE="${WRAPPER_LIVE:-/srv/qahwablk/order-deploy.sh}"
+WRAPPER_TRACKED="${WRAPPER_TRACKED:-$ROOT/order/scripts/root-wrapper/order-deploy.sh}"
+if [ ! -f "$WRAPPER_TRACKED" ]; then
+    drift_lines="${drift_lines}- order-deploy wrapper: tracked copy MISSING at ${WRAPPER_TRACKED}"$'\n'
+    n_drift=$((n_drift + 1))
+elif [ ! -f "$WRAPPER_LIVE" ]; then
+    drift_lines="${drift_lines}- order-deploy wrapper: live file MISSING at ${WRAPPER_LIVE}"$'\n'
+    n_drift=$((n_drift + 1))
+elif ! diff -q "$WRAPPER_LIVE" "$WRAPPER_TRACKED" >/dev/null 2>&1; then
+    drift_lines="${drift_lines}- order-deploy wrapper: live file differs from tracked copy (reinstall: cd $ROOT/order && sudo install -o root -g root -m 0750 scripts/root-wrapper/order-deploy.sh $WRAPPER_LIVE)"$'\n'
+    n_drift=$((n_drift + 1))
+fi
+
 if [ "$n_drift" -eq 0 ]; then
     echo "repo-drift: all ${n_checked} checkouts in sync"
     rm -f "$STATE_FILE"
