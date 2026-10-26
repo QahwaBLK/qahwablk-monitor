@@ -20,6 +20,8 @@ from pathlib import Path
 import psycopg2
 from dotenv import dotenv_values
 
+import waitlist_probe
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -61,11 +63,8 @@ INTERNAL_ENDPOINTS = [
 # Waitlist webhook handshake (qahwablk-waitlist.service on :8099). Meta-style
 # hub.challenge echo: healthy = HTTP 200 with body exactly "health".
 # min_failures=3 in main() = alert only after ~15 min down at the 5-min cadence.
-WAITLIST_VERIFY_TOKEN = "qahwablk_waitlist_2026"
-WAITLIST_HEALTH_URL = (
-    "http://localhost:8099/webhook"
-    "?hub.mode=subscribe&hub.verify_token={}&hub.challenge=health".format(WAITLIST_VERIFY_TOKEN)
-)
+# The token is read from the waitlist's own .env on every run (waitlist_probe.py),
+# so rotating it there needs no change here.
 
 # Nginx config drift: live file vs known-good baseline. Baseline must be
 # refreshed (cp live -> baseline) whenever a config change is deliberate.
@@ -215,7 +214,10 @@ def check_internal(url):
 
 def check_waitlist():
     """Webhook handshake: healthy = HTTP 200 and body exactly 'health'."""
-    req = urllib.request.Request(WAITLIST_HEALTH_URL, headers={"User-Agent": "BLK-HealthCheck/1.0"})
+    url = waitlist_probe.health_url()
+    if url is None:
+        return False, waitlist_probe.MISSING
+    req = urllib.request.Request(url, headers={"User-Agent": "BLK-HealthCheck/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             body = resp.read(64).decode("utf-8", errors="replace").strip()
