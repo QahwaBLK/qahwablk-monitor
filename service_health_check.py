@@ -22,6 +22,8 @@ import psycopg2
 import psycopg2.extras
 from dotenv import dotenv_values
 
+import waitlist_probe
+
 # ── Config ──────────────────────────────────────────────────────────────────
 
 ENV_FILE  = "/srv/qahwablk/cashier-dashboard/.env"
@@ -46,11 +48,8 @@ EXTERNAL_CHECKS = [
 # Waitlist (qahwablk-waitlist.service on :8099) is checked separately because
 # it uses a "GET /webhook?hub.mode=subscribe&...&hub.challenge=X" handshake
 # and we want to alert only after 3 consecutive failures (~15 min downtime).
-WAITLIST_VERIFY_TOKEN = "qahwablk_waitlist_2026"
-WAITLIST_HEALTH_URL = (
-    f"http://localhost:8099/webhook"
-    f"?hub.mode=subscribe&hub.verify_token={WAITLIST_VERIFY_TOKEN}&hub.challenge=health"
-)
+# The token is read from the waitlist's own .env on every run (waitlist_probe.py).
+# Logs, the audit row and the alert show waitlist_probe.DISPLAY_URL, never the token.
 WAITLIST_FAILURE_THRESHOLD = 3
 
 # Map external check name → internal check name (for mismatch detection)
@@ -441,11 +440,15 @@ def main():
             resolve_alert(cur, alert_key)
 
     # ── Waitlist check (3 consecutive failures threshold) ───────────────────
-    waitlist_status, waitlist_latency, waitlist_body = http_check_with_body(WAITLIST_HEALTH_URL)
+    waitlist_url = waitlist_probe.health_url()
+    if waitlist_url is None:
+        waitlist_status, waitlist_latency, waitlist_body = None, 0.0, waitlist_probe.MISSING
+    else:
+        waitlist_status, waitlist_latency, waitlist_body = http_check_with_body(waitlist_url)
     waitlist_ok = waitlist_status == 200 and waitlist_body.strip() == "health"
     waitlist_audit = "pass" if waitlist_ok else "fail"
     log_audit(cur, "waitlist_internal", waitlist_audit, {
-        "url":         WAITLIST_HEALTH_URL,
+        "url":         waitlist_probe.DISPLAY_URL,
         "status_code": waitlist_status,
         "latency_ms":  waitlist_latency,
         "body":        waitlist_body[:64],
@@ -466,7 +469,7 @@ def main():
                 f"<b>Waitlist API (qahwablk-waitlist :8099)</b> failing health check\n"
                 f"Consecutive failures: {n} (~{n*5} min downtime)\n"
                 f"Status: {waitlist_status or 'timeout'}  body={waitlist_body[:32]!r}\n"
-                f"URL: {WAITLIST_HEALTH_URL}\n"
+                f"URL: {waitlist_probe.DISPLAY_URL}\n"
                 f"Server: RhythmOS (89.167.18.87)\n"
                 f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
             )
